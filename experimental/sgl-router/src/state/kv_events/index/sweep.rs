@@ -89,11 +89,12 @@ pub(super) fn snapshot_fetch_timeout(deadline: Duration, cap: Duration) -> Durat
 }
 
 /// The handles a bounded peer sweep needs, cloned out of [`KvEventIndex`] so the
-/// sweep can run detached without borrowing `self`.
+/// sweep can run detached — or be awaited by the coordinator — without
+/// borrowing `self`.
 pub(super) struct BootstrapDeps {
     http: reqwest::Client,
-    peers: Arc<PeerRegistry>,
-    bootstrap: Arc<BootstrapTracker>,
+    pub(super) peers: Arc<PeerRegistry>,
+    pub(super) bootstrap: Arc<BootstrapTracker>,
     live_workers: Arc<Mutex<HashSet<KvWorkerId>>>,
     oracle: Arc<BlockSizeOracle>,
     ctrl_tx: mpsc::Sender<PumpControl>,
@@ -103,7 +104,7 @@ impl BootstrapDeps {
     /// Budget for one sweep. Before readiness settles, the remainder of the
     /// tracker's single `/readyz` window; once settled, a full `timeout()` for
     /// a late-discovered worker (`time_remaining` saturates at zero).
-    fn deadline(&self) -> Duration {
+    pub(super) fn deadline(&self) -> Duration {
         if self.bootstrap.settled() {
             return self.bootstrap.timeout();
         }
@@ -216,7 +217,7 @@ pub(super) async fn sweep_until_deadline(
 /// Turn a sweep result into the single [`PumpControl`] message its obligations
 /// are owed. Every exit path sends exactly one, which is what releases the ranks
 /// from `Pending`.
-async fn deliver_bootstrap(
+pub(super) async fn deliver_bootstrap(
     deps: &BootstrapDeps,
     obligations: Vec<(KvWorkerId, u64)>,
     result: SweepResult,
@@ -562,6 +563,7 @@ impl KvEventIndex {
             let ObligationBatch {
                 obligations,
                 holding_since,
+                late_join: _,
             } = batch;
             let ranks: Vec<KvWorkerId> = obligations.iter().map(|(r, _)| r.clone()).collect();
             let deadline = deps.deadline();
@@ -570,9 +572,9 @@ impl KvEventIndex {
         });
     }
 
-    /// Clone the handles a sweep needs, so it can run detached without
-    /// borrowing `self`.
-    fn bootstrap_deps(&self) -> BootstrapDeps {
+    /// Clone the handles a sweep needs, so it can run detached — or be awaited
+    /// by the coordinator — without borrowing `self`.
+    pub(super) fn bootstrap_deps(&self) -> BootstrapDeps {
         BootstrapDeps {
             http: self.snapshot_http.clone(),
             peers: Arc::clone(&self.peers),
