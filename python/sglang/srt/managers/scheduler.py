@@ -6026,6 +6026,16 @@ class Scheduler(
         from sglang.srt.managers.kv_eviction import splice_kv_row
 
         plan = req.kv_eviction_plan
+        # Logical positions run ahead of physical ones by the offset; cap
+        # generation so no token is computed past the model's position limit.
+        logical_room = (
+            self.model_config.context_len
+            - plan.position_offset
+            - len(req.origin_input_ids)
+        )
+        sp = req.sampling_params
+        sp.max_new_tokens = max(0, min(sp.max_new_tokens, logical_room))
+        sp.min_new_tokens = min(sp.min_new_tokens, sp.max_new_tokens)
         if plan.spec.evict_spans:
             cache = self._kv_eviction_streaming_cache()
             slot = cache.slots[req.session.session_id]
