@@ -1086,8 +1086,6 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Session info for continual prompting
     session_id: Optional[str] = None
     session_params: Optional[SessionParams] = None
-    # Explicit KV eviction call (validated again by the scheduler).
-    kv_eviction: Optional[Dict[str, Any]] = None
 
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
@@ -1161,6 +1159,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Shape of output_token_sampling_logprobs for each output token. This is a
     # defaulted tail field so older IPC senders decode as selected mode.
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
+
+    # Explicit KV eviction call (validated again by the scheduler). Kept last:
+    # the array-like wire layout must stay a prefix-match of the Rust schema.
+    kv_eviction: Optional[Dict[str, Any]] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
