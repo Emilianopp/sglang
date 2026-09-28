@@ -140,9 +140,12 @@ def run_session(url, tok, sid, n_calls, seed, max_new):
         st = info["cache_state"]
         check(st["parent_state_id"] == state_id, f"{sid} call {k}: broken state chain")
         check(st["resident_tokens"] == len(prompt) + len(out_ids), f"{sid} {k}: resident")
+        # The last sampled token has KV only if the engine already ran it
+        # (overlap scheduling launches one more decode before seeing the stop).
         check(
-            st["physical_tokens"] == st["resident_tokens"] - 1,
-            f"{sid} call {k}: physical {st['physical_tokens']} != resident - 1",
+            st["physical_tokens"] in (st["resident_tokens"] - 1, st["resident_tokens"]),
+            f"{sid} call {k}: physical {st['physical_tokens']} vs resident "
+            f"{st['resident_tokens']}",
         )
         events = resp["compaction_events"]
         if spans:
@@ -167,6 +170,7 @@ def run_session(url, tok, sid, n_calls, seed, max_new):
                 engine_lp=engine_lp,
                 offset=st["position_offset"],
                 physical_after=st["physical_tokens"],
+                resident_after=st["resident_tokens"],
                 position_map=st["position_map"],
             )
         )
@@ -244,7 +248,9 @@ def reference_logprobs(model, records, renumber):
         offset = rec["offset"]
         feed = ([deferred[0]] if deferred else []) + rec["new_ids"]
         out = rec["out_ids"]
-        feed_all = feed + out[:-1]
+        # Mirror the engine: materialize the last token iff it did.
+        materialized = rec["physical_after"] == rec["resident_after"]
+        feed_all = feed + (out if materialized else out[:-1])
         start = len(phys_logical)
         phys = list(range(start, start + len(feed_all)))
         logical = [p if renumber else p + offset for p in phys]
@@ -266,7 +272,13 @@ def reference_logprobs(model, records, renumber):
         ]
         results.append((ref, argmax_ok))
         phys_logical.extend(logical)
-        deferred = (out[-1], phys[-1] + 1 + (0 if renumber else offset))
+        assert len(phys_logical) == rec["physical_after"], (
+            len(phys_logical),
+            rec["physical_after"],
+        )
+        deferred = (
+            None if materialized else (out[-1], phys[-1] + 1 + (0 if renumber else offset))
+        )
     return results
 
 
