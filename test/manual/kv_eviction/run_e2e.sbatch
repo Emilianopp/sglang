@@ -13,7 +13,14 @@ set -u
 REPO=${REPO:-$SCRATCH/kv-race/sglang}
 OUT=${OUT:-$SCRATCH/kv-race/sglang_kve_e2e/$SLURM_JOB_ID}
 mkdir -p "$OUT"
-source "$REPO/.venv/bin/activate"
+# Run from a node-local copy of the venv: concurrent cold imports of
+# transformers from network scratch intermittently fail with ENOENT.
+VENV=$REPO/.venv
+if [ -n "${SLURM_TMPDIR:-}" ]; then
+  rsync -a "$REPO/.venv/" "$SLURM_TMPDIR/venv/" && VENV=$SLURM_TMPDIR/venv
+  sed -i "s#$REPO/.venv#$VENV#g" "$VENV/bin/activate"
+fi
+source "$VENV/bin/activate"
 export HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 # The cu13 wheels ship a full toolkit (nvcc, headers); JIT users (deep_ep,
 # flashinfer) need CUDA_HOME, and Mila modules stop at CUDA 12.6.
@@ -47,9 +54,17 @@ run_cfg() {  # gpu port tag model extra-args...
 }
 
 # Staggered: simultaneous cold imports from network scratch have failed reads.
-run_cfg 0 31000 default Qwen/Qwen3-0.6B; sleep 45
-run_cfg 1 31001 eager Qwen/Qwen3-0.6B --disable-cuda-graph --disable-overlap-schedule; sleep 45
-run_cfg 2 31002 chunked Qwen/Qwen3-0.6B --chunked-prefill-size 64; sleep 45
-run_cfg 3 31003 default4b Qwen/Qwen3-4B
+# Staggered starts keep JIT/compile caches from racing. CONFIGS selects a
+# subset, e.g. CONFIGS="default default4b".
+CONFIGS=${CONFIGS:-"default eager chunked default4b"}
+for c in $CONFIGS; do
+  case $c in
+    default)   run_cfg 0 31000 default Qwen/Qwen3-0.6B ;;
+    eager)     run_cfg 1 31001 eager Qwen/Qwen3-0.6B --disable-cuda-graph --disable-overlap-schedule ;;
+    chunked)   run_cfg 2 31002 chunked Qwen/Qwen3-0.6B --chunked-prefill-size 64 ;;
+    default4b) run_cfg 3 31003 default4b Qwen/Qwen3-4B ;;
+  esac
+  sleep 45
+done
 wait
 grep -h "RESULT\|FAIL" client_*.log
