@@ -24,7 +24,7 @@ class ThinkingMode(str, Enum):
 
 import jinja2
 import orjson
-from fastapi import Request
+from fastapi import HTTPException, Request
 
 try:
     from mistral_common.exceptions import MistralCommonException
@@ -1027,6 +1027,27 @@ class OpenAIServingChat(OpenAIServingBase):
         if request.return_sampling_mask and not request.return_meta_info:
             return "return_sampling_mask requires return_meta_info=true."
 
+        if request.kv_eviction is not None:
+            from sglang.srt.entrypoints.kv_eviction_http import (
+                validate_http_kv_eviction,
+            )
+            from sglang.srt.managers.kv_eviction import KvEvictionError
+
+            try:
+                validate_http_kv_eviction(
+                    request.kv_eviction,
+                    request.session_params,
+                    stream=bool(request.stream),
+                    n=request.n,
+                    has_exact_input_ids=request.input_ids is not None,
+                )
+            except KvEvictionError as e:
+                return str(e)
+            if request.rid is not None and request.rid != request.kv_eviction.get(
+                "call_id"
+            ):
+                return "kv_eviction requires rid == kv_eviction.call_id"
+
         media_error = self._validate_media_content(request)
         if media_error:
             return media_error
@@ -1288,6 +1309,11 @@ class OpenAIServingChat(OpenAIServingBase):
             and envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get()
         ):
             apply_header_overrides(adapted_request, raw_request.headers)
+
+        if request.kv_eviction is not None:
+            adapted_request.kv_eviction = request.kv_eviction
+            adapted_request.session_params = request.session_params
+            adapted_request.rid = request.kv_eviction["call_id"]
 
         return adapted_request, request
 
@@ -2239,6 +2265,10 @@ class OpenAIServingChat(OpenAIServingBase):
         raw_request: Request,
     ) -> ChatCompletionResponse | ErrorResponse | ORJSONResponse:
         """Handle non-streaming chat completion request"""
+        if adapted_request.kv_eviction is not None:
+            return await self._handle_kv_eviction_request(
+                adapted_request, request, raw_request
+            )
         try:
             ret = await self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
@@ -2256,6 +2286,52 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         return response
+
+    async def _handle_kv_eviction_request(
+        self,
+        adapted_request: GenerateReqInput,
+        request: ChatCompletionRequest,
+        raw_request: Request,
+    ) -> ORJSONResponse:
+        """Execute a kv_eviction chat call exactly once (retries join/replay)."""
+        from sglang.srt.entrypoints.kv_eviction_http import (
+            abort_result,
+            error_result,
+            run_kv_eviction_call,
+        )
+
+        try:
+            body = await raw_request.json() if raw_request is not None else None
+        except Exception:
+            body = request.model_dump(mode="json")
+
+        async def producer(generation: int):
+            adapted_request.kv_eviction_generation = generation
+            try:
+                # No client handle: a disconnect must not abort the mutation.
+                ret = await self.tokenizer_manager.generate_request(
+                    adapted_request, None
+                ).__anext__()
+            except HTTPException as e:
+                return int(e.status_code), {
+                    "error": {"message": str(e.detail), "code": int(e.status_code)}
+                }
+            except ValueError as e:
+                return error_result(e)
+            aborted = abort_result(ret)
+            if aborted is not None:
+                return aborted
+            response = self._build_chat_response(request, [ret], int(time.time()))
+            if isinstance(response, ORJSONResponse):
+                return response.status_code, orjson.loads(response.body)
+            return HTTPStatus.OK, response.model_dump(mode="json")
+
+        return await run_kv_eviction_call(
+            self.tokenizer_manager,
+            kv_eviction=adapted_request.kv_eviction,
+            body=body,
+            producer=producer,
+        )
 
     def _build_chat_response(
         self,
@@ -2440,6 +2516,21 @@ class OpenAIServingChat(OpenAIServingBase):
             video_tokens=video_tokens,
         )
 
+        kv_fields = {}
+        if ret[0]["meta_info"].get("kv_eviction") is not None:
+            from sglang.srt.entrypoints.kv_eviction_http import (
+                public_kv_eviction_fields,
+            )
+
+            kv_fields = public_kv_eviction_fields(ret[0]["meta_info"])
+            for choice in choices:
+                if choice.prompt_token_ids is not None:
+                    choice.prompt_token_ids = kv_fields["prompt_token_ids"]
+                if choice.meta_info is not None:
+                    choice.meta_info = {
+                        k: v for k, v in choice.meta_info.items() if k != "kv_eviction"
+                    }
+
         return ChatCompletionResponse(
             id=ret[0]["meta_info"]["id"],
             created=created,
@@ -2448,6 +2539,7 @@ class OpenAIServingChat(OpenAIServingBase):
             usage=usage,
             metadata=build_endpoint_weight_version_metadata(ret[0]["meta_info"]),
             sglext=response_sglext,
+            **kv_fields,
         )
 
     def _process_response_logprobs(self, ret_item: dict[str, Any]) -> ChoiceLogprobs:

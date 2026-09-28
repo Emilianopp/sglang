@@ -131,6 +131,8 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    SessionStatusReqInput,
+    SessionStatusReqOutput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
@@ -1729,6 +1731,7 @@ class Scheduler(
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
+                (SessionStatusReqInput, self.session_status),
                 (
                     UpdateWeightFromDiskReqInput,
                     self.weight_updater.update_weights_from_disk,
@@ -2763,6 +2766,12 @@ class Scheduler(
             recv_req.session_id is not None and self.enable_session_radix_cache
         )
 
+        if (
+            recv_req.kv_eviction is not None
+            and session_id is None
+            and not radix_native_session
+        ):
+            session_id = ""  # routed to the session-not-found branch below
         if session_id is None or radix_native_session:
             # Normal non-session request, or a radix-native session request
             if recv_req.input_embeds is not None:
@@ -2858,6 +2867,7 @@ class Scheduler(
         ):
             # Session exists and is not closing: create request from session
             session = self.session_controller.get(session_id)
+            kv_eviction_history = self._kv_eviction_session_has_history(session)
             req = session.create_req(
                 recv_req,
                 self.tokenizer,
@@ -2865,6 +2875,25 @@ class Scheduler(
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 disagg_mode=self.disaggregation_mode,
             )
+            if req.to_finish is None and (
+                recv_req.kv_eviction is not None or session.kv_eviction is not None
+            ):
+                kv_error = self._admit_kv_eviction(
+                    req, recv_req, session, had_history=kv_eviction_history
+                )
+                if kv_error is not None:
+                    req.set_finish_with_abort(
+                        str(kv_error),
+                        status_code=kv_error.status_code,
+                        err_type=(
+                            "ConflictError"
+                            if kv_error.status_code == HTTPStatus.CONFLICT
+                            else "BadRequestError"
+                        ),
+                    )
+                    self.init_req_max_new_tokens(req)
+                    self._add_request_to_queue(req)
+                    return
             if self.enable_session_radix_cache:
                 req.session_generation = self.tree_cache.ensure_session_generation(
                     session_id
@@ -3111,6 +3140,9 @@ class Scheduler(
             recv_req.pp_prefetch_ticketed = bool(self._prefetch_kvcache(req))
             self.tree_cache.bind_prefetch_ticket(req.rid, recv_req.pp_prefetch_ticketed)
 
+        if req.kv_eviction_plan is not None and req.to_finish is None:
+            self._apply_kv_eviction(req)
+
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
@@ -3245,7 +3277,7 @@ class Scheduler(
         # detach lives in `StreamingSession.find_active_slot`, which only runs
         # while scheduling; a session left in-flight rejects every later request.
         if req.session is not None and req.session.streaming:
-            req.session.abort_req()
+            req.session.abort_req(req)
             req.session = None
         # `beam_coordinator.validate_and_init` counts the group in ahead of the
         # checks that reject; no-op when the request has no group.
@@ -5860,6 +5892,147 @@ class Scheduler(
         ):
             return output
         return None
+
+    def session_status(self, recv_req: SessionStatusReqInput):
+        session = self.session_controller.get(recv_req.session_id)
+        output = SessionStatusReqOutput(
+            session_id=recv_req.session_id,
+            present=session is not None,
+            active_count=len(self.session_controller.sessions),
+        )
+        if session is not None:
+            output.streaming = session.streaming
+            output.inflight = session.inflight
+            output.deferred = session.close_on_finish
+            if session.kv_eviction is not None:
+                state = session.kv_eviction.state
+                output.kv_eviction_state = state.to_dict() if state else None
+                output.kv_eviction_invalid_reason = session.kv_eviction.invalid_reason
+        if (
+            get_parallel().pp_rank == 0
+            and get_parallel().tp_rank == 0
+            and get_parallel().attn_cp_rank == 0
+        ):
+            return output
+        return None
+
+    # -- Explicit KV eviction (see managers/kv_eviction.py) --
+
+    def _kv_eviction_streaming_cache(self):
+        from sglang.srt.session.streaming_session import StreamingSession
+
+        tree_cache = self.tree_cache
+        if isinstance(tree_cache, StreamingSession):
+            return tree_cache
+        session_cache = getattr(tree_cache, "session", None)
+        if isinstance(session_cache, StreamingSession):
+            return session_cache
+        return None
+
+    def _kv_eviction_session_has_history(self, session) -> bool:
+        cache = self._kv_eviction_streaming_cache()
+        has_slot = cache is not None and cache.has_slot(session.session_id)
+        return bool(session.has_history or session.req_nodes or has_slot)
+
+    def _admit_kv_eviction(self, req: Req, recv_req, session, *, had_history: bool):
+        """Validate a kv_eviction call and rewrite its prompt; KV is spliced
+        later by ``_apply_kv_eviction`` once no admission check can reject it."""
+        from sglang.srt.managers.kv_eviction import (
+            KvEvictionError,
+            KvEvictionSessionState,
+            build_plan,
+            parse_kv_eviction_request,
+            remove_spans,
+            validate_call,
+        )
+
+        try:
+            if not get_serving().enable_kv_eviction:
+                raise KvEvictionError(
+                    "kv_eviction requires --enable-kv-eviction on the server"
+                )
+            if recv_req.kv_eviction is None:
+                raise KvEvictionError(
+                    f"session {session.session_id} is owned by kv_eviction; every "
+                    "request on it must carry a kv_eviction object"
+                )
+            if not session.streaming:
+                raise KvEvictionError("kv_eviction requires a streaming session")
+            spec = parse_kv_eviction_request(recv_req.kv_eviction)
+            if spec.cache_id != session.session_id:
+                raise KvEvictionError(
+                    f"kv_eviction.cache_id {spec.cache_id} must equal the session id "
+                    f"{session.session_id}"
+                )
+            if recv_req.input_embeds is not None or recv_req.mm_inputs is not None:
+                raise KvEvictionError("kv_eviction supports text token inputs only")
+            cache = self._kv_eviction_streaming_cache()
+            if cache is None or cache.page_size != 1:
+                raise KvEvictionError(
+                    "kv_eviction requires a streaming-session radix cache with "
+                    "page size 1"
+                )
+            state = session.kv_eviction
+            if state is None:
+                if spec.call_index != 0 or had_history:
+                    raise KvEvictionError(
+                        f"session {session.session_id} was not claimed by a "
+                        "kv_eviction call_index=0 on an empty session",
+                        HTTPStatus.CONFLICT,
+                    )
+                state = KvEvictionSessionState()
+
+            new_input_len = len(recv_req.input_ids)
+            resident = len(req.origin_input_ids) - new_input_len
+            slot = cache.slots.get(session.session_id)
+            physical = (
+                slot.kv.kv_committed_len
+                if slot is not None and slot.kv.holds_kv
+                else 0
+            )
+            validate_call(
+                state,
+                spec,
+                session_has_history=had_history,
+                resident_tokens=resident,
+                physical_tokens=physical,
+                new_input_len=new_input_len,
+                context_len=self.model_config.context_len,
+                max_new_tokens=req.sampling_params.max_new_tokens,
+            )
+            plan = build_plan(
+                state,
+                spec,
+                assembled_prompt=req.origin_input_ids,
+                resident_tokens=resident,
+                physical_tokens=physical,
+            )
+        except KvEvictionError as e:
+            return e
+
+        prompt = array("q", remove_spans(req.origin_input_ids, spec.evict_spans))
+        req.origin_input_ids = prompt
+        req.origin_input_ids_unpadded = array("q", prompt)
+        req.full_untruncated_fill_ids = array("q")
+        req.kv_eviction_plan = plan
+        req.kv_position_offset = plan.position_offset
+        req.kv_eviction_bypass_radix = spec.call_index == 0
+        session.kv_eviction = state
+        state.pending = plan
+        return None
+
+    def _apply_kv_eviction(self, req: Req) -> None:
+        """Splice the evicted spans out of the session's KV row in place."""
+        from sglang.srt.managers.kv_eviction import splice_kv_row
+
+        plan = req.kv_eviction_plan
+        if plan.spec.evict_spans:
+            cache = self._kv_eviction_streaming_cache()
+            slot = cache.slots[req.session.session_id]
+            plan.slots_freed, plan.retained_slots_unchanged = splice_kv_row(
+                cache, slot.kv, plan.spec.evict_spans
+            )
+        plan.applied = True
 
     def close_session(self, recv_req: CloseSessionReqInput):
         if self.enable_session_radix_cache:

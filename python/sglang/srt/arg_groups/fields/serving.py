@@ -271,6 +271,10 @@ class Serving(msgspec.Struct):
     enable_streaming_session: A[
         bool, "Enable streaming session mode and StreamingSession wrapper."
     ] = False
+    enable_kv_eviction: A[
+        bool,
+        "Enable explicit client-driven KV eviction on streaming sessions (the `kv_eviction` request field). Requires --enable-streaming-session, --page-size 1, TP/PP/DP 1 and one tokenizer worker.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Constrained decoding

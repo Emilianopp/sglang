@@ -90,6 +90,10 @@ def _is_streaming(req: Optional[Req]) -> bool:
     return req is not None and req.session is not None and req.session.streaming
 
 
+def _is_kv_eviction(req: Optional[Req]) -> bool:
+    return req is not None and getattr(req, "kv_eviction_plan", None) is not None
+
+
 class StreamingSession(BasePrefixCache):
     """Adds streaming-session KV save/restore on top of any BasePrefixCache.
 
@@ -183,7 +187,7 @@ class StreamingSession(BasePrefixCache):
         if slot is None or not slot.kv.holds_kv:
             return None
         if req.to_finish is not None:
-            req.session.abort_req()
+            req.session.abort_req(req)
             req.session = None
             return None
         return slot
@@ -253,6 +257,10 @@ class StreamingSession(BasePrefixCache):
         # or speculative draft tokens).
         self._free_tail(req.kv, prefix_len)
 
+        if _is_kv_eviction(req):
+            # Evidence: how much resident KV this admission actually reuses.
+            req.kv_eviction_plan.matched_prefix_len = prefix_len
+
         device_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :prefix_len
         ].to(dtype=torch.int64)
@@ -300,7 +308,7 @@ class StreamingSession(BasePrefixCache):
             else:
                 assert kv is slot.kv
             self.release_session(session_id)
-            req.session.abort_req()
+            req.session.abort_req(req)
             return True
 
         if is_first:
@@ -320,10 +328,39 @@ class StreamingSession(BasePrefixCache):
         # to keep committed <= allocated for prepare_for_decode.
         slot.kv.kv_committed_len = min(target, slot.kv.kv_allocated_len)
 
+        if _is_kv_eviction(req) and req.finished():
+            self._finalize_kv_eviction(req, slot, resident_tokens=target)
+
         # Update req_nodes to this successfully finished request.
         req.session.finish_req(req)
 
         return True
+
+    def _finalize_kv_eviction(
+        self, req: Req, slot: SessionSlot, *, resident_tokens: int
+    ) -> None:
+        from sglang.srt.managers.kv_eviction import finalize_call
+
+        plan = req.kv_eviction_plan
+        if slot.kv.cache_protected_len != 0:
+            # The session must own every slot it may later free.
+            req.session.kv_eviction.invalid_reason = (
+                "session KV is shared with the radix cache"
+            )
+            logger.error(
+                "kv_eviction session %s holds %d radix-protected tokens",
+                req.session.session_id,
+                slot.kv.cache_protected_len,
+            )
+        req.kv_eviction_info = finalize_call(
+            req.session.kv_eviction,
+            plan,
+            prompt_ids=req.origin_input_ids,
+            resident_tokens_after=resident_tokens,
+            physical_tokens_after=slot.kv.kv_committed_len,
+            cached_tokens=req.cached_tokens,
+        )
+        req.kv_eviction_plan = None
 
     def try_cache_unfinished_req(
         self, req: Req, chunked: bool = False, **kwargs
@@ -342,6 +379,10 @@ class StreamingSession(BasePrefixCache):
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return True
         if req.session.session_id in self.slots:
+            return True
+        if _is_kv_eviction(req):
+            # First explicit-eviction call: keep its KV out of the radix tree so
+            # the session exclusively owns every slot it may later free.
             return True
         return False
 

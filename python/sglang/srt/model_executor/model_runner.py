@@ -2024,7 +2024,11 @@ class ModelRunner:
             (
                 forward_batch.positions
                 if forward_batch.forward_mode.is_decode()
-                else forward_batch.seq_lens - 1
+                else (
+                    forward_batch.seq_lens - 1
+                    if forward_batch.kv_position_offsets is None
+                    else forward_batch.seq_lens - 1 + forward_batch.kv_position_offsets
+                )
             ),
         )
         if observer_state is not None:

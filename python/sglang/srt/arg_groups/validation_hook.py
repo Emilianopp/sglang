@@ -312,6 +312,11 @@ def check_server_args(server_args: Any):
 
     check_load_publish_args(server_args)
 
+    if cfg.enable_kv_eviction:
+        from sglang.srt.managers.kv_eviction import reject_unsupported_server_args
+
+        reject_unsupported_server_args(cfg)
+
 
 def validate_buckets_rule(arg_name: str, buckets_rule: List[str]):
     if not buckets_rule:

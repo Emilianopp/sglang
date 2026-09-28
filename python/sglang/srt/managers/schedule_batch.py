@@ -1219,6 +1219,15 @@ class Req(ReqDllmMixin):
         # ChunkCache fallback, which has no tree nodes and no rebind.
         self.kv_rotation_base: Optional[int] = None
 
+        # Explicit KV eviction (managers/kv_eviction.py). The plan lives from
+        # admission until the call finishes; the info is its terminal metadata.
+        self.kv_eviction_plan = None
+        self.kv_eviction_info: Optional[Dict[str, Any]] = None
+        # Logical position = physical position + this, for every token computed.
+        self.kv_position_offset: int = 0
+        # Call 0 must not borrow radix-owned KV it might later free.
+        self.kv_eviction_bypass_radix: bool = False
+
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
         # processed.
@@ -1624,7 +1633,10 @@ class Req(ReqDllmMixin):
 
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
-        if self.positional_embed_overrides is not None:
+        if (
+            self.positional_embed_overrides is not None
+            or self.kv_eviction_bypass_radix
+        ):
             token_ids_to_match = array("q")
             key_limit = None
 

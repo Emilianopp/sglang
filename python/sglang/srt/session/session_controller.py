@@ -19,6 +19,7 @@ from array import array
 from typing import TYPE_CHECKING, Dict, Optional
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.kv_eviction import KvEvictionSessionState
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     OpenSessionReqInput,
@@ -96,12 +97,23 @@ class Session:
         self.req_nodes: Dict[str, SessionReqNode] = {}
         self.close_on_finish: bool = False
         self._inflight: bool = False
+        # rid of the request that set _inflight; only it may clear the flag.
+        self._inflight_rid: Optional[str] = None
         # Token-array lengths of last_req as of its finish_req. The share path
         # appends speculatively beyond these; only finish_req confirms them, so
         # _share_token_arrays trims back first (heals aborted turns).
         self.committed_origin_len: Optional[int] = None
         self.committed_unpadded_len: Optional[int] = None
         self.committed_fill_len: Optional[int] = None
+        # Explicit KV eviction (--enable-kv-eviction): set when call 0 claims
+        # this session; a claimed session accepts only kv_eviction calls.
+        self.kv_eviction: Optional[KvEvictionSessionState] = None
+        # Whether any request ever ran on this session (claim requires none).
+        self.has_history: bool = False
+
+    @property
+    def inflight(self) -> bool:
+        return self._inflight
 
     def is_timed_out(self) -> bool:
         if self.timeout is None:
@@ -272,11 +284,14 @@ class Session:
             # finished, and the committed_* lengths recorded by finish_req let
             # _share_token_arrays trim away tokens appended by an aborted turn.
             # offset / drop_previous_output rewrite history and must copy.
+            # Explicit KV eviction rewrites the resident sequence, so it must
+            # assemble a private copy rather than extend last_req's arrays.
             can_share_token_arrays = (
                 self.streaming
                 and self.committed_origin_len is not None
                 and not session_params.drop_previous_output
                 and not (session_params.offset and session_params.offset != 0)
+                and getattr(req, "kv_eviction", None) is None
             )
             if can_share_token_arrays:
                 input_ids, input_ids_unpadded, carry_fill = self._share_token_arrays(
@@ -342,6 +357,8 @@ class Session:
             self.last_active_time = time.monotonic()
             # req_nodes is NOT updated here — finish_req() handles it.
             self._inflight = True
+            self._inflight_rid = new_req.rid
+            self.has_history = True
         else:
             self.last_active_time = time.monotonic()
             new_req_node = SessionReqNode(new_req, last_req_node)
@@ -352,6 +369,7 @@ class Session:
     def finish_req(self, req):
         """Update req_nodes after a streaming request finishes successfully."""
         self._inflight = False
+        self._inflight_rid = None
         if self.req_nodes:
             [prev_node] = self.req_nodes.values()
             prev_node.req.session = None
@@ -362,9 +380,38 @@ class Session:
         self.committed_unpadded_len = len(req.origin_input_ids_unpadded)
         self.committed_fill_len = len(req.full_untruncated_fill_ids)
 
-    def abort_req(self):
-        """Clear inflight flag on abort (req_nodes stays unchanged)."""
+    def abort_req(self, req: Optional[Req] = None):
+        """Clear inflight flag on abort (req_nodes stays unchanged).
+
+        A request rejected at create_req (e.g. a concurrent second request)
+        never owned the session, so its abort must not touch the owner's state.
+        """
+        if (
+            req is not None
+            and self._inflight_rid is not None
+            and req.rid != self._inflight_rid
+        ):
+            return
         self._inflight = False
+        self._inflight_rid = None
+        kv = self.kv_eviction
+        if kv is not None and kv.pending is not None:
+            if (
+                kv.pending.applied
+                and kv.pending.spec.call_index > 0
+                and kv.invalid_reason is None
+            ):
+                # The resident KV was already rewritten (or released) for this
+                # call, so it no longer matches the committed state.
+                kv.invalid_reason = (
+                    f"call {kv.pending.spec.call_id} was aborted after admission"
+                )
+                logger.warning(
+                    "kv_eviction session %s invalidated: %s",
+                    self.session_id,
+                    kv.invalid_reason,
+                )
+            kv.pending = None
 
 
 class SessionController:

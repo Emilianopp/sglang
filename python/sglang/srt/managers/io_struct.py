@@ -269,6 +269,11 @@ class GenerateReqInput:
     modalities: Optional[List[str]] = None
     # Session info for continual prompting
     session_params: Optional[Dict[str, Any]] = None
+    # Explicit client-driven KV eviction on a streaming session
+    # (--enable-kv-eviction; see managers/kv_eviction.py).
+    kv_eviction: Optional[Dict[str, Any]] = None
+    # (Internal) session incarnation the kv_eviction call was admitted under.
+    kv_eviction_generation: Optional[int] = None
 
     # The path to the LoRA adaptors
     lora_path: Optional[Union[List[Optional[str]], str]] = None
@@ -436,6 +441,9 @@ class GenerateReqInput:
             self._normalize_batch_inputs()
 
         self._validate_rid_uniqueness()
+
+        if self.kv_eviction is not None and not self.is_single:
+            raise ValueError("kv_eviction requires a single (non-batch) request.")
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
@@ -1078,6 +1086,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Session info for continual prompting
     session_id: Optional[str] = None
     session_params: Optional[SessionParams] = None
+    # Explicit KV eviction call (validated again by the scheduler).
+    kv_eviction: Optional[Dict[str, Any]] = None
 
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
@@ -1590,6 +1600,8 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
 
     # Customized info
     customized_info: Optional[PickleWrapper] = None
+    # Terminal explicit-KV-eviction metadata per request (None when absent)
+    kv_eviction_infos: Optional[List[Optional[Dict[str, Any]]]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
     # DP rank of the scheduler that processed each request
@@ -1684,6 +1696,8 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
 
     # Customized info
     customized_info: Optional[PickleWrapper] = None
+    # Terminal explicit-KV-eviction metadata per request (None when absent)
+    kv_eviction_infos: Optional[List[Optional[Dict[str, Any]]]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
     # DP rank of the scheduler that processed each request
@@ -2318,11 +2332,30 @@ class OpenSessionReqInput(BaseReq, kw_only=True):
 
 class CloseSessionReqInput(BaseReq, kw_only=True):
     session_id: str
+    # With --enable-kv-eviction: seconds to wait for a deferred close (an
+    # in-flight request) to complete before reporting status "timeout".
+    wait_timeout: Optional[float] = None
 
 
 class OpenSessionReqOutput(BaseReq, kw_only=True):
     session_id: Optional[str]
     success: bool
+
+
+class SessionStatusReqInput(BaseReq, kw_only=True):
+    session_id: str
+
+
+class SessionStatusReqOutput(BaseReq, kw_only=True):
+    session_id: str
+    present: bool
+    streaming: bool = False
+    inflight: bool = False
+    deferred: bool = False
+    active_count: int = 0
+    # Explicit KV eviction: committed state (or None) and invalidation reason.
+    kv_eviction_state: Optional[Dict[str, Any]] = None
+    kv_eviction_invalid_reason: Optional[str] = None
 
 
 class HealthCheckOutput(BaseReq, kw_only=True):

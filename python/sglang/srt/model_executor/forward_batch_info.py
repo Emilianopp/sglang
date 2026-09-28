@@ -619,6 +619,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
     # Position information
     positions: torch.Tensor = None
+    # Per-request logical-position offsets (explicit KV eviction); None when
+    # every request in the batch has offset 0.
+    kv_position_offsets: Optional[torch.Tensor] = None
 
     # For extend
     extend_num_tokens: Optional[int] = None
@@ -1105,6 +1108,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.positions = positions
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
 
+        if any(req.kv_position_offset for req in batch.reqs):
+            ret._apply_kv_position_offsets(batch, device)
+
         if model_runner.ngram_embedding_manager.enabled:
             ret._init_ngram_embedding_info(batch, device)
 
@@ -1146,6 +1152,27 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         return ret
+
+    def _apply_kv_position_offsets(self, batch: ScheduleBatch, device) -> None:
+        """Map physical positions to logical ones after explicit KV eviction.
+
+        Surviving KV keeps the RoPE it was computed with, and only tokens past
+        every evicted span are ever computed, so one offset per request is exact.
+        """
+        offsets = torch.tensor(
+            [req.kv_position_offset for req in batch.reqs],
+            dtype=self.positions.dtype,
+            pin_memory=is_pin_memory_available(device),
+        ).to(device, non_blocking=True)
+        self.kv_position_offsets = offsets
+        if self.forward_mode.is_decode():
+            self.positions = self.positions + offsets
+        else:
+            self.positions = self.positions + torch.repeat_interleave(
+                offsets,
+                self.extend_seq_lens.to(torch.int64),
+                output_size=self.positions.shape[0],
+            )
 
     def _maybe_init_non_generation_fields(self, batch: ScheduleBatch):
         """Derive non-generation (max_new_tokens==0) forward fields from reqs.

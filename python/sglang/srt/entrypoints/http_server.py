@@ -125,6 +125,7 @@ from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     CheckWeightsReqInput,
     CloseSessionReqInput,
+    SessionStatusReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
@@ -916,6 +917,8 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
+    if obj.kv_eviction is not None:
+        return await _kv_eviction_generate_request(obj, request)
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
@@ -958,6 +961,72 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
+
+
+async def _kv_eviction_generate_request(obj: GenerateReqInput, request: Request):
+    """Native /generate with an explicit kv_eviction call (exactly-once)."""
+    from sglang.srt.entrypoints.kv_eviction_http import (
+        abort_result,
+        error_result,
+        public_kv_eviction_fields,
+        run_kv_eviction_call,
+        validate_http_kv_eviction,
+    )
+    from fastapi import HTTPException
+
+    from sglang.srt.managers.kv_eviction import KvEvictionError
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    try:
+        exact_ids = isinstance(obj.input_ids, list) and all(
+            type(t) is int for t in obj.input_ids
+        )
+        validate_http_kv_eviction(
+            obj.kv_eviction,
+            obj.session_params,
+            stream=bool(obj.stream),
+            has_exact_input_ids=exact_ids and obj.text is None,
+        )
+        if obj.rid is None:
+            obj.rid = obj.kv_eviction["call_id"]
+        elif obj.rid != obj.kv_eviction["call_id"]:
+            raise KvEvictionError("kv_eviction requires rid == kv_eviction.call_id")
+    except KvEvictionError as e:
+        status, content = error_result(e)
+        return ORJSONResponse(content=content, status_code=status)
+
+    async def producer(generation: int):
+        obj.kv_eviction_generation = generation
+        try:
+            # No client handle: a disconnect must not abort the mutation.
+            ret = await _global_state.tokenizer_manager.generate_request(
+                obj, None
+            ).__anext__()
+        except HTTPException as e:
+            return int(e.status_code), {
+                "error": {"message": str(e.detail), "code": int(e.status_code)}
+            }
+        except ValueError as e:
+            return error_result(e)
+        aborted = abort_result(ret)
+        if aborted is not None:
+            return aborted
+        out = dict(ret)
+        out.update(public_kv_eviction_fields(ret["meta_info"]))
+        out["meta_info"] = {
+            k: v for k, v in ret["meta_info"].items() if k != "kv_eviction"
+        }
+        return HTTPStatus.OK, out
+
+    return await run_kv_eviction_call(
+        _global_state.tokenizer_manager,
+        kv_eviction=obj.kv_eviction,
+        body=body,
+        producer=producer,
+    )
 
 
 @app.api_route("/encode", methods=["POST", "PUT"])
@@ -1643,10 +1712,30 @@ async def open_session(obj: Annotated[OpenSessionReqInput, Body()], request: Req
 async def close_session(obj: Annotated[CloseSessionReqInput, Body()], request: Request):
     """Close the session."""
     try:
-        await _global_state.tokenizer_manager.close_session(obj, request)
-        return Response(status_code=200)
+        result = await _global_state.tokenizer_manager.close_session(obj, request)
+        if result is None:
+            return Response(status_code=200)
+        # --enable-kv-eviction: success only once the scheduler confirms absence.
+        status_code = (
+            HTTPStatus.OK if result["status"] == "closed" else HTTPStatus.CONFLICT
+        )
+        return ORJSONResponse(content=result, status_code=status_code)
     except Exception as e:
         return _create_error_response(e)
+
+
+@app.api_route("/session_status", methods=["GET", "POST"])
+async def session_status(
+    obj: Annotated[SessionStatusReqInput, Body()], request: Request
+):
+    """Scheduler-authoritative status of one session."""
+    status = await _global_state.tokenizer_manager.session_status(obj.session_id)
+    if status is None:
+        return ORJSONResponse(
+            {"error": {"message": "session status timed out"}},
+            status_code=HTTPStatus.GATEWAY_TIMEOUT,
+        )
+    return ORJSONResponse(msgspec_to_builtins(status))
 
 
 @app.api_route("/configure_logging", methods=["GET", "POST"])

@@ -935,6 +935,9 @@ class ChatCompletionRequest(BaseModel):
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_id: Optional[str] = None
     session_params: Optional[Dict] = None
+    # Explicit client-driven KV eviction on a streaming session
+    # (--enable-kv-eviction). Requires input_ids, n=1 and stream=false.
+    kv_eviction: Optional[Dict[str, Any]] = None
     separate_reasoning: bool = True
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
@@ -1252,12 +1255,27 @@ class ChatCompletionResponse(BaseModel):
     usage: UsageInfo
     metadata: Optional[Dict[str, Any]] = None
     sglext: Optional[SglExt] = None
+    # Explicit KV eviction (only set for kv_eviction calls): the authoritative
+    # post-eviction prompt, the call's state/event/evidence, and the
+    # vLLM-compatible single admission event.
+    prompt_token_ids: Optional[List[int]] = None
+    kv_eviction: Optional[Dict[str, Any]] = None
+    compaction_events: Optional[List[Dict[str, Any]]] = None
+    compaction_replay_mode: Optional[str] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.sglext is None:
             data.pop("sglext", None)
+        for key in (
+            "prompt_token_ids",
+            "kv_eviction",
+            "compaction_events",
+            "compaction_replay_mode",
+        ):
+            if data.get(key) is None:
+                data.pop(key, None)
         return data
 
 

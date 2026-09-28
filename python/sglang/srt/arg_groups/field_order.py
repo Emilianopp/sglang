@@ -159,6 +159,7 @@ POSITIONAL_FIELD_ORDER = (
     "stream_response_default_include_usage",
     "incremental_streaming_output",
     "enable_streaming_session",
+    "enable_kv_eviction",
     "enable_session_radix_cache",
     "log_level",
     "log_level_http",

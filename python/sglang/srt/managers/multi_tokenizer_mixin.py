@@ -257,6 +257,9 @@ def _handle_output_by_index(output, i):
                 output, "indexer_topk", i, check_length=False
             ),
             retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
+            kv_eviction_infos=_extract_field_by_index(
+                output, "kv_eviction_infos", i, check_length=False
+            ),
             weight_versions=_extract_field_by_index(output, "weight_versions", i),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
@@ -381,6 +384,9 @@ def _handle_output_by_index(output, i):
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
+            kv_eviction_infos=_extract_field_by_index(
+                output, "kv_eviction_infos", i, check_length=False
+            ),
             beam_search_output=_extract_field_by_index(
                 output, "beam_search_output", i, check_length=True
             ),

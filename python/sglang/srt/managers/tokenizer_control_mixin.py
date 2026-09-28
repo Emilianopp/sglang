@@ -53,6 +53,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
+    SessionStatusReqInput,
+    SessionStatusReqOutput,
     PdRoleSwitchReqInput,
     PdRoleSwitchReqOutput,
     ProfileReq,
@@ -1021,6 +1023,9 @@ class TokenizerControlMixin:
         elif obj.session_id in self.session_futures:
             return None
 
+        # A (re)opened id is a new incarnation: stale kv_eviction calls from a
+        # previous one can no longer be dispatched or answered from cache.
+        self.kv_eviction_registry.invalidate(obj.session_id)
         future = asyncio.Future()
         self.session_futures[obj.session_id] = future
         self._dispatch_to_scheduler(obj)
@@ -1035,7 +1040,51 @@ class TokenizerControlMixin:
         obj: CloseSessionReqInput,
         request: Optional[fastapi.Request] = None,
     ):
+        self.kv_eviction_registry.invalidate(obj.session_id)
         await self._async_dispatch_to_scheduler(obj)
+        if not get_serving().enable_kv_eviction:
+            return None
+        # Confirm absence from the scheduler instead of inferring it: a close
+        # of a session with an in-flight request is deferred until it ends.
+        wait_timeout = 0.0 if obj.wait_timeout is None else float(obj.wait_timeout)
+        deadline = time.monotonic() + max(0.0, wait_timeout)
+        while True:
+            status = await self.session_status(obj.session_id)
+            if status is None:
+                return {"session_id": obj.session_id, "status": "unresolved"}
+            if not status.present:
+                return {"session_id": obj.session_id, "status": "closed"}
+            if time.monotonic() >= deadline:
+                return {
+                    "session_id": obj.session_id,
+                    "status": "timeout" if wait_timeout > 0 else "closing",
+                    "inflight": status.inflight,
+                    "deferred": status.deferred,
+                }
+            await asyncio.sleep(0.05)
+
+    async def session_status(
+        self: TokenizerManager,
+        session_id: str,
+        timeout: float = 30.0,
+    ) -> Optional[SessionStatusReqOutput]:
+        """Scheduler-authoritative snapshot of one session (None on timeout)."""
+        self.auto_create_handle_loop()
+        future = asyncio.get_running_loop().create_future()
+        waiters = self.session_status_futures.setdefault(session_id, [])
+        waiters.append(future)
+        if len(waiters) == 1:
+            self._dispatch_to_scheduler(SessionStatusReqInput(session_id=session_id))
+        try:
+            return await asyncio.wait_for(asyncio.shield(future), timeout)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            remaining = self.session_status_futures.get(session_id)
+            if remaining is not None and future in remaining:
+                remaining.remove(future)
+                if not remaining:
+                    self.session_status_futures.pop(session_id, None)
 
     async def update_weight_version(
         self: TokenizerManager, obj: UpdateWeightVersionReqInput

@@ -88,6 +88,7 @@ from sglang.srt.managers.io_struct import (
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
+    SessionStatusReqOutput,
     PauseGenerationReqInput,
     ScaleElasticEPReqInput,
     ScaleElasticEPReqOutput,
@@ -103,6 +104,7 @@ from sglang.srt.managers.io_struct import (
     sock_send,
     unwrap_from_pickle,
 )
+from sglang.srt.managers.kv_eviction_registry import KvEvictionCallRegistry
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -669,6 +671,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Session
         self.session_futures = {}  # session_id -> asyncio event
+        self.session_status_futures: Dict[str, List[asyncio.Future]] = {}
+        # Explicit KV eviction: exactly-once call execution + incarnations.
+        self.kv_eviction_registry = KvEvictionCallRegistry()
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
@@ -833,6 +838,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             [
                 (AbortReq, self._handle_abort_req),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
+                (SessionStatusReqOutput, self._handle_session_status_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
                     self._handle_update_weights_from_disk_req_output,
@@ -903,6 +909,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     state = self.rid_to_state[obj.rid]
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
+                    if isinstance(obj, GenerateReqInput) and obj.kv_eviction:
+                        self._check_kv_eviction_dispatch(obj)
                     await self._send_one_request(tokenized_obj)
                     async for response in self._wait_one_response(obj, request):
                         yield response
@@ -1518,6 +1526,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 positional_embed_overrides=obj.positional_embed_overrides,
                 session_id=obj.session_id,
                 session_params=session_params,
+                kv_eviction=obj.kv_eviction,
                 custom_logit_processor=obj.custom_logit_processor,
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
@@ -2440,6 +2449,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     meta_info["cached_tokens_details"] = recv_obj.cached_tokens_details[
                         i
                     ]
+                kv_eviction_infos = getattr(recv_obj, "kv_eviction_infos", None)
+                if kv_eviction_infos is not None and kv_eviction_infos[i] is not None:
+                    meta_info["kv_eviction"] = kv_eviction_infos[i]
                 if customized_info is not None:
                     self.update_request_meta_info(
                         meta_info,
@@ -3491,6 +3503,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.elastic_last_error = None
         return responses[0]
 
+    def _handle_session_status_req_output(self, recv_obj):
+        waiters = self.session_status_futures.pop(recv_obj.session_id, [])
+        for future in waiters:
+            if not future.done():
+                future.set_result(recv_obj)
+
     def _handle_open_session_req_output(self, recv_obj):
         future = self.session_futures.get(recv_obj.session_id)
         if future is None:
@@ -3583,6 +3601,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         for i, sub_obj in obj.__dict__.get("_sub_obj_cache", {}).items():
             sub_obj.lora_id = (
                 obj.lora_id[i] if isinstance(obj.lora_id, list) else obj.lora_id
+            )
+
+    def _check_kv_eviction_dispatch(self, obj: GenerateReqInput) -> None:
+        """Refuse a kv_eviction call whose session incarnation went stale."""
+        if not get_serving().enable_kv_eviction:
+            raise ValueError(
+                "kv_eviction requires the server to be launched with "
+                "--enable-kv-eviction"
+            )
+        cache_id = obj.kv_eviction.get("cache_id") if isinstance(
+            obj.kv_eviction, dict
+        ) else None
+        if isinstance(cache_id, str):
+            self.kv_eviction_registry.check_dispatch(
+                cache_id, obj.kv_eviction_generation
             )
 
     def _init_req_state(

@@ -499,6 +499,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             routed_experts=routed_experts,
             indexer_topk=indexer_topk,
             customized_info=recv_obj.customized_info,
+            kv_eviction_infos=recv_obj.kv_eviction_infos,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=recv_obj.retraction_counts,

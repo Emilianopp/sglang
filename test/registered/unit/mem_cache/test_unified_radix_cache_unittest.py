@@ -11021,7 +11021,7 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         cache, allocator, pool = build_fixture(self.cfg)
         node, lock = self._lock_and_early_release(cache, allocator)
         session = SimpleNamespace(
-            session_id="s2", streaming=True, abort_req=lambda: None
+            session_id="s2", streaming=True, abort_req=lambda req=None: None
         )
         req = self._streaming_req(node, lock, session=session)
         req.finished_reason = FINISH_ABORT()
