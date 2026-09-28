@@ -697,5 +697,19 @@ def reject_unsupported_server_args(server_args: Any) -> None:
         errors.append("is incompatible with LMCache")
     if getattr(server_args, "enable_dp_attention", False):
         errors.append("is incompatible with DP attention")
+    # Hybrid linear-attention (GDN/Mamba) models: eviction removes only
+    # full-attention KV and keeps the session's live recurrent state, so that
+    # state must be the plain per-request one (no buffered/checkpointed copies).
+    if getattr(server_args, "enable_mamba_extra_buffer", False):
+        errors.append(
+            "requires --mamba-radix-cache-strategy no_buffer on hybrid "
+            "linear-attention models"
+        )
+    if getattr(server_args, "enable_linear_replayssm", False) or getattr(
+        server_args, "enable_linear_replayssm_spec", False
+    ):
+        errors.append("is incompatible with ReplaySSM linear-attention decode")
+    if getattr(server_args, "enable_int8_mamba_checkpoint", False):
+        errors.append("is incompatible with --enable-int8-mamba-checkpoint")
     if errors:
         raise ValueError("--enable-kv-eviction " + "; ".join(errors))

@@ -214,9 +214,22 @@ def run_session(url, tok, sid, n_calls, seed, max_new):
 
 
 def prune_cache(cache, keep):
+    """Drop evicted positions from attention KV only.
+
+    Hybrid linear-attention layers (Qwen3.5 Gated DeltaNet) keep their
+    recurrent/conv state untouched -- exactly what the server does.
+    """
+    from transformers.cache_utils import LinearAttentionCacheLayerMixin
+
     idx = torch.tensor(keep, device="cuda", dtype=torch.long)
     if hasattr(cache, "layers"):
         for layer in cache.layers:
+            if isinstance(layer, LinearAttentionCacheLayerMixin) and not hasattr(
+                layer, "values"
+            ):
+                continue
+            if getattr(layer, "keys", None) is None or layer.keys.numel() == 0:
+                continue
             layer.keys = layer.keys.index_select(-2, idx)
             layer.values = layer.values.index_select(-2, idx)
     else:
@@ -230,7 +243,7 @@ def reference_logprobs(model, records, renumber):
     """Replay a session in HF with engine semantics; return per-call logprobs."""
     from transformers import DynamicCache
 
-    cache = DynamicCache()
+    cache = DynamicCache(config=model.config)
     phys_logical = []  # logical position of each cached (physical) token
     deferred = None  # (token, logical) sampled but not yet in cache
     results = []
@@ -332,9 +345,18 @@ def main():
     check(code == 200 and chat.get("prompt_token_ids") == ids, "chat prompt_token_ids echo")
     post(args.url, "/close_session", {"session_id": sid, "wait_timeout": 5})
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=torch.bfloat16, attn_implementation="sdpa"
-    ).cuda().eval()
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, dtype=torch.bfloat16, attn_implementation="sdpa"
+        )
+    except (ValueError, KeyError):
+        # Multimodal checkpoints (e.g. Qwen3.5 *ForConditionalGeneration).
+        from transformers import AutoModelForImageTextToText
+
+        model = AutoModelForImageTextToText.from_pretrained(
+            args.model, dtype=torch.bfloat16, attn_implementation="sdpa"
+        )
+    model = model.cuda().eval()
     summary = {"correct": [], "renumbered": [], "top1": [], "top1_renum": []}
     for records in all_records:
         good = reference_logprobs(model, records, renumber=False)

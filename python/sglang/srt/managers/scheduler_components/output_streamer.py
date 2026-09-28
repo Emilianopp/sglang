@@ -515,7 +515,7 @@ class _GenerationStreamAccumulator:
 
         self.retraction_counts.append(req.retraction_count)
         self.kv_eviction_infos.append(
-            req.kv_eviction_info if req.finished() else None
+            getattr(req, "kv_eviction_info", None) if req.finished() else None
         )
         if req.finished():
             self.weight_versions.append(

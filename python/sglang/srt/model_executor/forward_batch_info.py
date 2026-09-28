@@ -1108,9 +1108,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.positions = positions
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
 
-        if any(req.kv_position_offset for req in batch.reqs):
-            ret._apply_kv_position_offsets(batch, device)
-
         if model_runner.ngram_embedding_manager.enabled:
             ret._init_ngram_embedding_info(batch, device)
 
@@ -1129,6 +1126,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
             else:
                 ret._compute_mrope_positions(model_runner, batch)
+
+        if any(req.kv_position_offset for req in batch.reqs):
+            ret._apply_kv_position_offsets(batch, device)
 
         # Init lora information
         if (
@@ -1166,13 +1166,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ).to(device, non_blocking=True)
         self.kv_position_offsets = offsets
         if self.forward_mode.is_decode():
-            self.positions = self.positions + offsets
+            per_token = offsets
         else:
-            self.positions = self.positions + torch.repeat_interleave(
+            per_token = torch.repeat_interleave(
                 offsets,
                 self.extend_seq_lens.to(torch.int64),
                 output_size=self.positions.shape[0],
             )
+        self.positions = self.positions + per_token
+        if self.mrope_positions is not None:
+            # Text-only requests (kv_eviction rejects multimodal input) have
+            # identical temporal/height/width channels: shift all three.
+            self.mrope_positions = self.mrope_positions + per_token.to(
+                self.mrope_positions.dtype
+            ).unsqueeze(0)
 
     def _maybe_init_non_generation_fields(self, batch: ScheduleBatch):
         """Derive non-generation (max_new_tokens==0) forward fields from reqs.

@@ -63,6 +63,9 @@ for c in $CONFIGS; do
     eager)     run_cfg 1 31001 eager Qwen/Qwen3-0.6B --disable-cuda-graph --disable-overlap-schedule ;;
     chunked)   run_cfg 2 31002 chunked Qwen/Qwen3-0.6B --chunked-prefill-size 64 ;;
     default4b) run_cfg 3 31003 default4b Qwen/Qwen3-4B ;;
+    # Hybrid Gated DeltaNet + full attention (24 + 8 layers), M-RoPE.
+    q35)       run_cfg 2 31004 q35 Qwen/Qwen3.5-4B --mamba-radix-cache-strategy no_buffer ;;
+    q35nooverlap) run_cfg 3 31005 q35nooverlap Qwen/Qwen3.5-4B --mamba-radix-cache-strategy no_buffer --disable-overlap-schedule ;;
   esac
   sleep 45
 done
@@ -75,7 +78,7 @@ if [ "${UNIT:-1}" = "1" ]; then
   BASE=${BASE:-0823651b0b10cd331295e6c821fe41908a7f378f}
   WT=$SLURM_TMPDIR/upstream_base
   git -C "$REPO" worktree add -f --detach "$WT" "$BASE" >/dev/null 2>&1
-  SUITES="registered/unit/mem_cache/test_unified_radix_cache_unittest.py registered/unit/mem_cache/test_streaming_session_unit.py registered/unit/mem_cache/test_session_token_share_unit.py registered/unit/managers/test_io_struct.py registered/unit/entrypoints/openai/test_serving_chat.py registered/unit/entrypoints/openai/test_protocol.py registered/unit/managers/test_output_streamer_customized_info.py"
+  SUITES="registered/unit/managers/test_kv_eviction.py registered/unit/mem_cache/test_unified_radix_cache_unittest.py registered/unit/mem_cache/test_streaming_session_unit.py registered/unit/mem_cache/test_session_token_share_unit.py registered/unit/managers/test_io_struct.py registered/unit/entrypoints/openai/test_serving_chat.py registered/unit/entrypoints/openai/test_protocol.py registered/unit/managers/test_output_streamer_customized_info.py"
   for side in branch base; do
     if [ $side = branch ]; then root=$REPO; pp=""; else root=$WT; pp=$WT/python; fi
     ( cd "$root/test" && CUDA_VISIBLE_DEVICES=0 PYTHONPATH=$pp timeout 3000 \
