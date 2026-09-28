@@ -1,3 +1,101 @@
+# KV-Streams fork of SGLang
+
+This fork adds **explicit, client-driven KV eviction** to SGLang streaming
+sessions. A client can delete any token spans from a live session's KV cache
+between turns. The server splices those KV slots out in place. Surviving
+tokens are **never recomputed** and keep their original (RoPE) positions.
+New tokens continue from the largest position used so far. The feature works
+on dense models (e.g. Qwen3) and on hybrid Gated DeltaNet models (Qwen3.5).
+On hybrid models only full-attention KV is evicted; the recurrent state is
+kept as-is.
+
+Full reference: [`docs/advanced_features/kv_eviction.md`](docs/advanced_features/kv_eviction.md).
+
+### Launch
+
+```bash
+python -m sglang.launch_server --model-path Qwen/Qwen3-4B \
+  --enable-streaming-session --enable-kv-eviction --page-size 1
+# Qwen3.5 (hybrid): also --mamba-radix-cache-strategy no_buffer --disable-overlap-schedule
+```
+
+Supported topology: one GPU per server (TP/PP/DP = 1) and one tokenizer
+worker. Speculative decoding, PD disaggregation, HiCache and LMCache are
+rejected at startup.
+
+### New APIs
+
+| Endpoint | Body | Returns |
+|---|---|---|
+| `POST /open_session` | `{"session_id", "capacity_of_str_len", "streaming": true}` | the session id |
+| `POST /generate` or `/v1/chat/completions` | normal request plus `session_params: {"id"}`, `input_ids` (new tokens only) and a `kv_eviction` object | generation plus eviction metadata (below) |
+| `POST /session_status` | `{"session_id"}` | `present`, `inflight`, `deferred`, `kv_eviction_state` |
+| `POST /close_session` | `{"session_id", "wait_timeout"}` | `200 {"status": "closed"}` once the scheduler confirms the session is gone; otherwise `409` |
+
+The `kv_eviction` request object:
+
+```json
+{"version": 1, "cache_id": "ep-1", "call_id": "ep-1-c3", "call_index": 3,
+ "expected_state_id": "sha256:<state_id from the previous call>",
+ "protected_prefix_len": 32,
+ "evict_spans": [[32, 64], [256, 512], [617, 632]]}
+```
+
+- **Spans:** any number of sorted, non-overlapping `[start, end)` ranges. They
+  index the session's *resident sequence*: the previous call's
+  `prompt_token_ids` followed by its output tokens.
+- **What can be evicted:** spans may not touch the protected prefix, and may
+  not cover tokens whose KV hasn't been computed yet (the last sampled token
+  may still be pending).
+- **Call 0:** claims a freshly opened session, evicts nothing, and sends
+  `expected_state_id: null`.
+- **Later calls:** each one sends `call_index + 1` and the previous call's
+  `state_id`.
+- **Optional:** `evict_group_ids` is client metadata, echoed back in the event.
+
+### What a call returns (in addition to the normal generation)
+
+- `prompt_token_ids`: the prompt the engine actually ran, after eviction.
+  Store this, not your own reconstruction.
+- `kv_eviction.cache_state`:
+  - `state_id` and `parent_state_id`, which form a hash chain;
+  - `position_offset` (tokens evicted so far);
+  - `resident_tokens` and `physical_tokens`;
+  - `position_map`: runs of `[physical_start, logical_start, length]` giving
+    each surviving token's original position.
+- `kv_eviction.event`: the spans evicted by this call, `tokens_evicted`, and
+  `event_id`.
+- `kv_eviction.evidence`:
+  - `slots_freed`, which equals `tokens_evicted`;
+  - `retained_tokens_prefilled`, which is `0` because survivors are never
+    recomputed;
+  - `reused_tokens` and `new_tokens_prefilled`.
+- `compaction_events` and `compaction_replay_mode: "prefill_trim"`: one
+  combined vLLM-compatible event per evicting call, with `kept_indices`,
+  `kept_token_ids` and `num_prompt_tokens`, for trainer replay.
+
+### Errors and retries
+
+- A retry with an identical body and `call_id` returns the cached response and
+  never evicts twice.
+- A changed body under the same `call_id` returns `409`. So does a stale
+  `expected_state_id` or `call_index`, or a second call while one is still
+  running. A rejected call leaves the state unchanged.
+- If a call is aborted after its KV was modified, the session is invalidated.
+  Close and reopen it.
+- All calls in a session must go to the same server, because the retry cache
+  and session state are held by that server.
+
+### Semantics to keep in mind
+
+Surviving KV was computed while the evicted tokens were still visible, so
+eviction is **not** the same as re-prefilling the shortened prompt. The exact
+reference drops the evicted positions from a live KV cache and continues at
+the logical positions; see `test/manual/kv_eviction/e2e_kv_eviction.py`. On
+Qwen3.5 the DeltaNet state still carries the evicted content.
+
+---
+
 <div align="center" id="sglangtop">
 <img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
 
