@@ -45,7 +45,8 @@ run_cfg() {  # gpu port tag model extra-args...
     done
     python "$REPO/test/manual/kv_eviction/e2e_kv_eviction.py" \
       --url "http://127.0.0.1:$port" --model "$model" --tag "$tag" \
-      > "client_$tag.log" 2>&1
+      --temperature "${TEMP:-0}" --max-new "${MAXNEW:-24}" \
+      --dump "$OUT/tokens_$tag.json" > "client_$tag.log" 2>&1
     rc=$?
     echo "[$tag] client rc=$rc"
     kill $spid; wait $spid 2>/dev/null
@@ -64,7 +65,7 @@ for c in $CONFIGS; do
     chunked)   run_cfg 2 31002 chunked Qwen/Qwen3-0.6B --chunked-prefill-size 64 ;;
     default4b) run_cfg 3 31003 default4b Qwen/Qwen3-4B ;;
     # Hybrid Gated DeltaNet + full attention (24 + 8 layers), M-RoPE.
-    q35)       run_cfg 2 31004 q35 Qwen/Qwen3.5-4B --mamba-radix-cache-strategy no_buffer ;;
+    # (no_buffer requires --disable-overlap-schedule upstream)
     q35nooverlap) run_cfg 3 31005 q35nooverlap Qwen/Qwen3.5-4B --mamba-radix-cache-strategy no_buffer --disable-overlap-schedule ;;
   esac
   sleep 45

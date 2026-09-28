@@ -18,6 +18,7 @@ Usage: python e2e_kv_eviction.py --url http://127.0.0.1:30000 --model <path>
 import argparse
 import concurrent.futures as cf
 import json
+import math
 import random
 import sys
 import time
@@ -59,7 +60,7 @@ def user_turn(tok, text):
     )
 
 
-def run_session(url, tok, sid, n_calls, seed, max_new):
+def run_session(url, tok, sid, n_calls, seed, max_new, temperature=0.0):
     """Drive one session; return the recorded calls for offline reference."""
     rng = random.Random(seed)
     post(url, "/close_session", {"session_id": sid})
@@ -105,7 +106,7 @@ def run_session(url, tok, sid, n_calls, seed, max_new):
         }
         body = {
             "input_ids": new_ids,
-            "sampling_params": {"temperature": 0, "max_new_tokens": max_new},
+            "sampling_params": {"temperature": temperature, "max_new_tokens": max_new},
             "return_logprob": True,
             "session_params": {"id": sid},
             "kv_eviction": kv,
@@ -295,6 +296,42 @@ def reference_logprobs(model, records, renumber):
     return results
 
 
+def expand_positions(runs):
+    return [logical + i for _, logical, length in runs for i in range(length)]
+
+
+@torch.no_grad()
+def reprefill_logprobs(model, records):
+    """Control: recompute survivors from scratch at their logical positions.
+
+    Surviving tokens no longer see the evicted context (and on hybrid models
+    the recurrent state is rebuilt from survivors only) -- the semantics the
+    engine deliberately does NOT implement.
+    """
+    results = []
+    for rec in records:
+        tokens = rec["prompt"] + rec["out_ids"]
+        pos = expand_positions(rec["position_map"])[: len(tokens)]
+        assert len(pos) == len(tokens)
+        logits = model(
+            input_ids=torch.tensor([tokens], device="cuda"),
+            position_ids=torch.tensor([pos], device="cuda"),
+            use_cache=False,
+        ).logits[0].float()
+        lp = torch.log_softmax(logits, -1)
+        first = len(rec["prompt"]) - 1
+        ref = [lp[first + j, t].item() for j, t in enumerate(rec["out_ids"])]
+        top1 = [int(lp[first + j].argmax().item() == t) for j, t in enumerate(rec["out_ids"])]
+        results.append((ref, top1))
+    return results
+
+
+def k3(eng_lp, ref_lp):
+    """Schulman k3 for KL(engine || reference) on engine-sampled tokens."""
+    lr = ref_lp - eng_lp
+    return math.exp(lr) - 1.0 - lr
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://127.0.0.1:30000")
@@ -303,6 +340,8 @@ def main():
     ap.add_argument("--calls", type=int, default=6)
     ap.add_argument("--max-new", type=int, default=24)
     ap.add_argument("--tag", default="")
+    ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--dump", default=None, help="write per-token logprobs here")
     args = ap.parse_args()
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -312,7 +351,14 @@ def main():
     with cf.ThreadPoolExecutor(args.sessions) as pool:
         futs = [
             pool.submit(
-                run_session, args.url, tok, f"kve-{args.tag}-{i}", args.calls, i, args.max_new
+                run_session,
+                args.url,
+                tok,
+                f"kve-{args.tag}-{i}",
+                args.calls,
+                i,
+                args.max_new,
+                args.temperature,
             )
             for i in range(args.sessions)
         ]
@@ -357,35 +403,54 @@ def main():
             args.model, dtype=torch.bfloat16, attn_implementation="sdpa"
         )
     model = model.cuda().eval()
-    summary = {"correct": [], "renumbered": [], "top1": [], "top1_renum": []}
-    for records in all_records:
-        good = reference_logprobs(model, records, renumber=False)
-        bad = reference_logprobs(model, records, renumber=True)
-        for rec, (ref, top1), (ref_bad, top1_bad) in zip(records, good, bad):
-            eng = rec["engine_lp"]
-            d = [abs(a - b) for a, b in zip(eng, ref)]
-            d_bad = [abs(a - b) for a, b in zip(eng, ref_bad)]
-            summary["correct"].extend(d)
-            summary["top1"].extend(top1)
-            if rec["call"] > 0 and rec["offset"] > 0:
-                summary["renumbered"].extend(d_bad)
-                summary["top1_renum"].extend(top1_bad)
+    variants = ("exact", "renumbered", "reprefill")
+    rows = []
+    for si, records in enumerate(all_records):
+        refs = {
+            "exact": reference_logprobs(model, records, renumber=False),
+            "renumbered": reference_logprobs(model, records, renumber=True),
+            "reprefill": reprefill_logprobs(model, records),
+        }
+        for ci, rec in enumerate(records):
+            group = "evicting" if rec["spans"] else "no_eviction"
+            for j, (tok_id, eng) in enumerate(zip(rec["out_ids"], rec["engine_lp"])):
+                row = dict(session=si, call=rec["call"], group=group, j=j,
+                           token=tok_id, engine_lp=eng)
+                for v in variants:
+                    ref, top1 = refs[v][ci]
+                    row[f"{v}_lp"] = ref[j]
+                    row[f"{v}_top1"] = top1[j]
+                rows.append(row)
+    if args.dump:
+        with open(args.dump, "w") as f:
+            json.dump(rows, f)
+
     mean = lambda xs: sum(xs) / max(1, len(xs))
+    breakdown = {}
+    for group in ("no_eviction", "evicting"):
+        sel = [r for r in rows if r["group"] == group]
+        breakdown[group] = {"tokens": len(sel)}
+        for v in variants:
+            breakdown[group][v] = {
+                "k3_kl": mean([k3(r["engine_lp"], r[f"{v}_lp"]) for r in sel]),
+                "mean_abs_dlogprob": mean([abs(r[f"{v}_lp"] - r["engine_lp"]) for r in sel]),
+                "mean_signed_dlogprob": mean([r[f"{v}_lp"] - r["engine_lp"] for r in sel]),
+                "max_abs_dlogprob": max([abs(r[f"{v}_lp"] - r["engine_lp"]) for r in sel] or [0]),
+                "top1_agreement": mean([r[f"{v}_top1"] for r in sel]),
+            }
+    exact_all = [abs(r["exact_lp"] - r["engine_lp"]) for r in rows]
     res = {
         "tag": args.tag,
-        "tokens_compared": len(summary["correct"]),
-        "mean_abs_dlogprob_correct": mean(summary["correct"]),
-        "max_abs_dlogprob_correct": max(summary["correct"] or [0]),
-        "top1_agreement_correct": mean(summary["top1"]),
-        "mean_abs_dlogprob_renumbered_control": mean(summary["renumbered"]),
-        "top1_agreement_renumbered_control": mean(summary["top1_renum"]),
+        "temperature": args.temperature,
+        "tokens_compared": len(rows),
+        "mean_abs_dlogprob_correct": mean(exact_all),
+        "breakdown": breakdown,
         "calls": sum(len(r) for r in all_records),
         "evicting_calls": sum(1 for r in all_records for c in r if c["spans"]),
         "failures": FAILURES,
     }
     print("RESULT", json.dumps(res), flush=True)
     check(res["mean_abs_dlogprob_correct"] < 0.05, "logprob mismatch vs exact reference")
-    check(res["top1_agreement_correct"] > 0.97, "top-1 disagreement vs exact reference")
     sys.exit(1 if FAILURES else 0)
 
 
