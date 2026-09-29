@@ -326,6 +326,98 @@ def reprefill_logprobs(model, records):
     return results
 
 
+_NEVER = 1 << 30
+_FLEX_STATE = {"block_mask": None}
+
+
+def _kv_death_flex_attention(module, query, key, value, attention_mask, **kwargs):
+    """Attention layer = flex_attention with the session's death-position mask."""
+    from transformers.integrations.flex_attention import flex_attention_forward
+
+    kwargs.pop("dropout", None)
+    return flex_attention_forward(
+        module, query, key, value, _FLEX_STATE["block_mask"], **kwargs
+    )
+
+
+def enable_kv_death_flex(model):
+    """Register and switch the model's attention layers to the death-mask flex path."""
+    from transformers import AttentionInterface
+
+    AttentionInterface.register("kv_death_flex", _kv_death_flex_attention)
+    model.set_attn_implementation("kv_death_flex")
+
+
+def build_chronological_stream(records):
+    """Chronological token stream of one session + per-token call/death indices.
+
+    S = prompt_0 + out_0 + new_1 + out_1 + ...; S index == engine logical
+    position. query_call[i] = call in which token i was computed (a deferred
+    final token is computed at the start of the next call); death[j] = call
+    whose admission evicted token j.
+    """
+    S, query_call, death, resident, score_idx = [], [], [], [], []
+    pending = None
+    for k, rec in enumerate(records):
+        if rec["spans"]:
+            evicted = {resident[i] for a, b in rec["spans"] for i in range(a, b)}
+            for j in evicted:
+                death[j] = k
+            resident = [j for j in resident if j not in evicted]
+        if pending is not None:
+            query_call[pending] = k
+            pending = None
+        for t in rec["new_ids"]:
+            S.append(t), query_call.append(k), death.append(_NEVER)
+            resident.append(len(S) - 1)
+        start = len(S)
+        for t in rec["out_ids"]:
+            S.append(t), query_call.append(k), death.append(_NEVER)
+            resident.append(len(S) - 1)
+        if rec["physical_after"] != rec["resident_after"]:
+            pending = len(S) - 1
+            query_call[pending] = k + 1
+        score_idx.append(list(range(start - 1, start - 1 + len(rec["out_ids"]))))
+        assert len(resident) == rec["resident_after"], (len(resident), rec["resident_after"])
+    return S, query_call, death, score_idx
+
+
+@torch.no_grad()
+def flex_logprobs(model, records):
+    """Trainer-style reference: ONE forward over the chronological stream.
+
+    Full-attention layers use flex_attention with key j visible to query i iff
+    j <= i and query_call[i] < death[j]; linear-attention (DeltaNet) layers see
+    the whole unpruned stream. Should equal the incremental replay exactly (up
+    to kernel numerics).
+    """
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    S, query_call, death, score_idx = build_chronological_stream(records)
+    n = len(S)
+    qc = torch.tensor(query_call, device="cuda", dtype=torch.int32)
+    dth = torch.tensor(death, device="cuda", dtype=torch.int32)
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        return (kv_idx <= q_idx) & (qc[q_idx] < dth[kv_idx])
+
+    _FLEX_STATE["block_mask"] = create_block_mask(
+        mask_mod, B=None, H=None, Q_LEN=n, KV_LEN=n, device="cuda"
+    )
+    logits = model(
+        input_ids=torch.tensor([S], device="cuda"),
+        position_ids=torch.arange(n, device="cuda")[None],
+        use_cache=False,
+    ).logits[0].float()
+    lp = torch.log_softmax(logits, -1)
+    results = []
+    for rec, idxs in zip(records, score_idx):
+        ref = [lp[i, t].item() for i, t in zip(idxs, rec["out_ids"])]
+        top1 = [int(lp[i].argmax().item() == t) for i, t in zip(idxs, rec["out_ids"])]
+        results.append((ref, top1))
+    return results
+
+
 def k3(eng_lp, ref_lp):
     """Schulman k3 for KL(engine || reference) on engine-sampled tokens."""
     lr = ref_lp - eng_lp
@@ -411,14 +503,22 @@ def main():
             args.model, dtype=torch.bfloat16, attn_implementation="sdpa"
         )
     model = model.cuda().eval()
-    variants = ("exact", "renumbered", "reprefill")
+    variants = ("exact", "flex", "renumbered", "reprefill")
+    all_refs = []
+    for records in all_records:
+        all_refs.append(
+            {
+                "exact": reference_logprobs(model, records, renumber=False),
+                "renumbered": reference_logprobs(model, records, renumber=True),
+                "reprefill": reprefill_logprobs(model, records),
+            }
+        )
+    # Same weights, attention layers switched to the death-mask flex kernel.
+    enable_kv_death_flex(model)
+    for records, refs in zip(all_records, all_refs):
+        refs["flex"] = flex_logprobs(model, records)
     rows = []
-    for si, records in enumerate(all_records):
-        refs = {
-            "exact": reference_logprobs(model, records, renumber=False),
-            "renumbered": reference_logprobs(model, records, renumber=True),
-            "reprefill": reprefill_logprobs(model, records),
-        }
+    for si, (records, refs) in enumerate(zip(all_records, all_refs)):
         for ci, rec in enumerate(records):
             if rec["spans"]:
                 group = "evicting"
@@ -459,6 +559,15 @@ def main():
                 "top1_agreement": mean([r[f"{v}_top1"] for r in sel]),
             }
     exact_all = [abs(r["exact_lp"] - r["engine_lp"]) for r in rows]
+    # Direct check that the trainer-style flex formulation == incremental replay.
+    for group in breakdown:
+        sel = [r for r in rows if r["group"] == group]
+        breakdown[group]["flex_vs_exact_mean_abs"] = mean(
+            [abs(r["flex_lp"] - r["exact_lp"]) for r in sel]
+        )
+        breakdown[group]["flex_vs_exact_max_abs"] = max(
+            [abs(r["flex_lp"] - r["exact_lp"]) for r in sel] or [0]
+        )
     res = {
         "tag": args.tag,
         "temperature": args.temperature,
