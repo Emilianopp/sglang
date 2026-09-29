@@ -66,7 +66,7 @@ for c in $CONFIGS; do
     default4b) run_cfg 3 31003 default4b Qwen/Qwen3-4B ;;
     # Hybrid Gated DeltaNet + full attention (24 + 8 layers), M-RoPE.
     # (no_buffer requires --disable-overlap-schedule upstream)
-    q35nooverlap) run_cfg 3 31005 q35nooverlap Qwen/Qwen3.5-4B --mamba-radix-cache-strategy no_buffer --disable-overlap-schedule ;;
+    q35nooverlap) run_cfg 2 31005 q35nooverlap Qwen/Qwen3.5-4B --mamba-radix-cache-strategy no_buffer --disable-overlap-schedule ;;
   esac
   sleep 45
 done
