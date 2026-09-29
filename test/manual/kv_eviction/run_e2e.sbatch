@@ -46,6 +46,7 @@ run_cfg() {  # gpu port tag model extra-args...
     python "$REPO/test/manual/kv_eviction/e2e_kv_eviction.py" \
       --url "http://127.0.0.1:$port" --model "$model" --tag "$tag" \
       --temperature "${TEMP:-0}" --max-new "${MAXNEW:-24}" \
+      --control-sessions "${CONTROL:-0}" \
       --dump "$OUT/tokens_$tag.json" > "client_$tag.log" 2>&1
     rc=$?
     echo "[$tag] client rc=$rc"

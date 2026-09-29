@@ -60,7 +60,7 @@ def user_turn(tok, text):
     )
 
 
-def run_session(url, tok, sid, n_calls, seed, max_new, temperature=0.0):
+def run_session(url, tok, sid, n_calls, seed, max_new, temperature=0.0, evict=True):
     """Drive one session; return the recorded calls for offline reference."""
     rng = random.Random(seed)
     post(url, "/close_session", {"session_id": sid})
@@ -87,7 +87,7 @@ def run_session(url, tok, sid, n_calls, seed, max_new, temperature=0.0):
     for k in range(n_calls):
         new_ids = first if k == 0 else user_turn(tok, f"Continue, turn {k}. Be brief.")
         spans = []
-        if k > 0:
+        if k > 0 and evict:
             # 1-3 random disjoint spans inside [protected, physical).
             lo, hi = protected, physical
             cuts = sorted(rng.sample(range(lo, hi), min(hi - lo, 2 * rng.randint(1, 3))))
@@ -337,6 +337,12 @@ def main():
     ap.add_argument("--url", default="http://127.0.0.1:30000")
     ap.add_argument("--model", required=True)
     ap.add_argument("--sessions", type=int, default=4)
+    ap.add_argument(
+        "--control-sessions",
+        type=int,
+        default=0,
+        help="extra sessions that append every call but never evict (depth-matched noise floor)",
+    )
     ap.add_argument("--calls", type=int, default=6)
     ap.add_argument("--max-new", type=int, default=24)
     ap.add_argument("--tag", default="")
@@ -348,7 +354,8 @@ def main():
 
     tok = AutoTokenizer.from_pretrained(args.model)
     t0 = time.time()
-    with cf.ThreadPoolExecutor(args.sessions) as pool:
+    n_total = args.sessions + args.control_sessions
+    with cf.ThreadPoolExecutor(n_total) as pool:
         futs = [
             pool.submit(
                 run_session,
@@ -359,8 +366,9 @@ def main():
                 i,
                 args.max_new,
                 args.temperature,
+                i < args.sessions,
             )
-            for i in range(args.sessions)
+            for i in range(n_total)
         ]
         all_records = [f.result() for f in futs]
     print(f"[{args.tag}] sessions done in {time.time() - t0:.1f}s", flush=True)
@@ -412,10 +420,17 @@ def main():
             "reprefill": reprefill_logprobs(model, records),
         }
         for ci, rec in enumerate(records):
-            group = "evicting" if rec["spans"] else "no_eviction"
+            if rec["spans"]:
+                group = "evicting"
+            elif rec["call"] == 0:
+                group = "call0"
+            else:
+                group = "later_no_eviction"
             for j, (tok_id, eng) in enumerate(zip(rec["out_ids"], rec["engine_lp"])):
                 row = dict(session=si, call=rec["call"], group=group, j=j,
-                           token=tok_id, engine_lp=eng)
+                           token=tok_id, engine_lp=eng,
+                           depth=len(rec["prompt"]) + j,
+                           chrono=rec["offset"] + len(rec["prompt"]) + j)
                 for v in variants:
                     ref, top1 = refs[v][ci]
                     row[f"{v}_lp"] = ref[j]
@@ -427,9 +442,14 @@ def main():
 
     mean = lambda xs: sum(xs) / max(1, len(xs))
     breakdown = {}
-    for group in ("no_eviction", "evicting"):
+    for group in ("call0", "later_no_eviction", "evicting"):
         sel = [r for r in rows if r["group"] == group]
-        breakdown[group] = {"tokens": len(sel)}
+        breakdown[group] = {
+            "tokens": len(sel),
+            # physical context length (what the kernels see) and logical position
+            "mean_physical_depth": mean([r["depth"] for r in sel]),
+            "mean_logical_position": mean([r["chrono"] for r in sel]),
+        }
         for v in variants:
             breakdown[group][v] = {
                 "k3_kl": mean([k3(r["engine_lp"], r[f"{v}_lp"]) for r in sel]),
