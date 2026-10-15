@@ -671,6 +671,30 @@ def splice_kv_row(
     return int(removed.numel()), unchanged
 
 
+def merge_session_status(replies: list) -> Any:
+    """One snapshot from every DP rank's reply for the same session.
+
+    Session open/close reach every rank, but a session's calls run on the one
+    rank they are routed to, so only that rank holds KV-eviction state. The
+    session is present / in flight / deferred if it is on any rank.
+    """
+    merged = replies[0]
+    for other in replies[1:]:
+        merged.present = merged.present or other.present
+        merged.streaming = merged.streaming or other.streaming
+        merged.inflight = merged.inflight or other.inflight
+        merged.deferred = merged.deferred or other.deferred
+        merged.active_count = max(merged.active_count, other.active_count)
+        if merged.kv_eviction_invalid_reason is None:
+            merged.kv_eviction_invalid_reason = other.kv_eviction_invalid_reason
+        mine, theirs = merged.kv_eviction_state, other.kv_eviction_state
+        if theirs is not None and (
+            mine is None or theirs.get("call_index", -1) > mine.get("call_index", -1)
+        ):
+            merged.kv_eviction_state = theirs
+    return merged
+
+
 def reject_unsupported_server_args(server_args: Any) -> None:
     """Refuse configurations whose position/cache semantics were not proven."""
     errors = []
@@ -678,7 +702,9 @@ def reject_unsupported_server_args(server_args: Any) -> None:
         errors.append("requires --enable-streaming-session")
     if getattr(server_args, "page_size", 1) not in (None, 1):
         errors.append("requires --page-size 1")
-    for flag in ("tp_size", "pp_size", "dp_size"):
+    # dp_size > 1 is supported: every call of a session is pinned to one rank
+    # (routed_dp_rank) and session status is merged across ranks.
+    for flag in ("tp_size", "pp_size"):
         if (getattr(server_args, flag, 1) or 1) != 1:
             errors.append(f"requires --{flag.replace('_', '-')} 1")
     if (getattr(server_args, "tokenizer_worker_num", 1) or 1) != 1:

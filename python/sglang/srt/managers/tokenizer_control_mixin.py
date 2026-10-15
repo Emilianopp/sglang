@@ -1074,6 +1074,8 @@ class TokenizerControlMixin:
         waiters = self.session_status_futures.setdefault(session_id, [])
         waiters.append(future)
         if len(waiters) == 1:
+            # Drop replies to an earlier request that timed out before all ranks answered.
+            self.session_status_partials.pop(session_id, None)
             self._dispatch_to_scheduler(SessionStatusReqInput(session_id=session_id))
         try:
             return await asyncio.wait_for(asyncio.shield(future), timeout)
