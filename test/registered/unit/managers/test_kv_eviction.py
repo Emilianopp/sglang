@@ -14,8 +14,10 @@ from sglang.srt.managers.kv_eviction import (
     finalize_call,
     kept_indices,
     logical_positions,
+    merge_session_status,
     parse_kv_eviction_request,
     position_map_len,
+    reject_unsupported_server_args,
     remove_spans,
     splice_kv_row,
     validate_call,
@@ -422,3 +424,33 @@ def test_registry_cancelled_waiter_does_not_cancel_producer():
         await asyncio.wait_for(done.wait(), 1)
 
     asyncio.run(scenario())
+
+
+def _status(present, state=None, **kw):
+    from sglang.srt.managers.io_struct import SessionStatusReqOutput
+
+    return SessionStatusReqOutput(
+        session_id="s", present=present, kv_eviction_state=state, **kw
+    )
+
+
+def test_session_status_merges_dp_ranks():
+    # The idle rank holds the session but no eviction state; the routed rank holds both.
+    idle = _status(True, None, streaming=True, active_count=3)
+    routed = _status(True, {"call_index": 4, "state_id": "sha256:x"}, inflight=True, active_count=5)
+    merged = merge_session_status([idle, routed])
+    assert merged.present and merged.inflight and merged.streaming
+    assert merged.kv_eviction_state["call_index"] == 4
+    assert merged.active_count == 5
+    # Closed on one rank only: still present until every rank has closed it.
+    assert merge_session_status([_status(False), _status(True)]).present
+    assert not merge_session_status([_status(False), _status(False)]).present
+
+
+def test_dp_size_is_accepted_but_dp_attention_is_not():
+    base = dict(enable_streaming_session=True, page_size=1)
+    reject_unsupported_server_args(SimpleNamespace(**base, dp_size=2))
+    with pytest.raises(ValueError, match="DP attention"):
+        reject_unsupported_server_args(
+            SimpleNamespace(**base, dp_size=2, enable_dp_attention=True)
+        )

@@ -104,6 +104,7 @@ from sglang.srt.managers.io_struct import (
     sock_send,
     unwrap_from_pickle,
 )
+from sglang.srt.managers.kv_eviction import merge_session_status
 from sglang.srt.managers.kv_eviction_registry import KvEvictionCallRegistry
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import wrap_shm_features
@@ -672,6 +673,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Session
         self.session_futures = {}  # session_id -> asyncio event
         self.session_status_futures: Dict[str, List[asyncio.Future]] = {}
+        # dp_size > 1: per-session replies collected until every rank answered.
+        self.session_status_partials: Dict[str, List[SessionStatusReqOutput]] = {}
         # Explicit KV eviction: exactly-once call execution + incarnations.
         self.kv_eviction_registry = KvEvictionCallRegistry()
 
@@ -3504,6 +3507,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return responses[0]
 
     def _handle_session_status_req_output(self, recv_obj):
+        dp_size = get_parallel().dp_size
+        if dp_size > 1:
+            # Every DP rank answers; resolve once all have.
+            replies = self.session_status_partials.setdefault(recv_obj.session_id, [])
+            replies.append(recv_obj)
+            if len(replies) < dp_size:
+                return
+            del self.session_status_partials[recv_obj.session_id]
+            recv_obj = merge_session_status(replies)
         waiters = self.session_status_futures.pop(recv_obj.session_id, [])
         for future in waiters:
             if not future.done():
@@ -3616,6 +3628,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if isinstance(cache_id, str):
             self.kv_eviction_registry.check_dispatch(
                 cache_id, obj.kv_eviction_generation
+            )
+        if get_parallel().dp_size > 1 and obj.routed_dp_rank is None:
+            raise ValueError(
+                "kv_eviction with dp_size > 1 requires routed_dp_rank: every "
+                "call of a session must run on the rank that holds its KV"
             )
 
     def _init_req_state(

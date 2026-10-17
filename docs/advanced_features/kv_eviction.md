@@ -13,8 +13,10 @@ python -m sglang.launch_server --model-path Qwen/Qwen3-4B \
   --enable-streaming-session --enable-kv-eviction --page-size 1
 ```
 
-Required: `--page-size 1`, TP/PP/DP = 1, one tokenizer worker, the radix
-cache enabled. Rejected with: speculative decoding, PD disaggregation,
+Required: `--page-size 1`, TP/PP = 1, one tokenizer worker, the radix
+cache enabled. Data parallel (`--dp-size N`) works when every call of a
+session carries the same `routed_dp_rank` (calls without one are refused);
+`/session_status` merges every rank's answer. Rejected with: speculative decoding, PD disaggregation,
 HiCache, LMCache, DP attention, `--enable-session-radix-cache`.
 
 ## Session lifecycle
