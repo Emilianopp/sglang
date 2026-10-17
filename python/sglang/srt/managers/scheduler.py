@@ -5492,6 +5492,14 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            # A queued request never reaches the step that marks requests
+            # finished: mark it here and release its session's in-flight claim,
+            # or a deferred session close waits on it forever (and a streaming
+            # session keeps its KV pinned).
+            if req.finished_reason is None:
+                req.finished_reason = FINISH_ABORT("Aborted by AbortReq.")
+            if req.session is not None and getattr(req.session, "streaming", False):
+                req.session.abort_req(req)
             self._release_aborted_request(req)
             self.beam_coordinator.retire_group(req)
             # Without the initiator's reason the tokenizer falls back to a
